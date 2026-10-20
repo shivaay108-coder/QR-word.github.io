@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Secure QR Vault</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#07111f;color:#edf6ff;font-family:Arial,sans-serif}
+header{text-align:center;padding:22px;background:#101e32;border-bottom:1px solid #25415f}
+header h1{color:#50e6ff;margin:0 0 8px}
+header p{color:#a9bfd5;margin:0}
+main{max-width:720px;margin:auto;padding:16px}
+.card{background:#101e32;border:1px solid #29415d;border-radius:16px;padding:18px;margin-bottom:16px}
+h2{font-size:19px;margin-top:0;color:#69e8ff}
+input,textarea,button{width:100%;padding:13px;margin:7px 0;border-radius:9px;border:1px solid #34516e;font-size:15px}
+input,textarea{background:#07111f;color:white}
+textarea{min-height:100px;resize:vertical}
+button{background:#00c9e8;color:#04111a;border:0;font-weight:bold;cursor:pointer}
+button.secondary{background:#263d58;color:white}
+button.danger{background:#a9344a;color:white}
+button:disabled{opacity:.5}
+.small{font-size:12px;color:#a9bfd5;line-height:1.6}
+.stat{display:flex;gap:10px;flex-wrap:wrap}
+.stat div{flex:1;min-width:130px;background:#07111f;padding:14px;border-radius:10px}
+.stat strong{display:block;color:#60edff;font-size:24px;margin-top:6px}
+#qr{display:block;width:260px;height:260px;max-width:100%;margin:14px auto;background:white;padding:8px;border-radius:10px}
+.hidden{display:none}
+.item{padding:10px;border-bottom:1px solid #29415d;overflow-wrap:anywhere}
+.notice{background:#172d43;padding:12px;border-radius:9px;color:#d1eaff;font-size:13px;line-height:1.6}
+</style>
+</head>
+<body>
+<header>
+<h1>🔐 Secure QR Vault</h1>
+<p>Offline message encryption and QR wallet</p>
+</header>
+
+<main>
+<section class="card" id="loginBox">
+<h2>🔑 Local Account</h2>
+<input id="username" placeholder="Username" autocomplete="username">
+<input id="password" type="password" placeholder="Password" autocomplete="current-password">
+<button id="loginBtn">Login / Create Account</button>
+<p class="small">Account data stays in this browser. Clearing browser data may delete it.</p>
+<p id="loginStatus" class="small"></p>
+</section>
+
+<section id="app" class="hidden">
+<div class="card">
+<h2>👛 Coin Wallet</h2>
+<div class="stat">
+<div>Available Coins<strong id="coins">0</strong></div>
+<div>Today's QR Count<strong id="count">0</strong></div>
+</div>
+<button class="secondary" id="claimBtn">Claim Daily 20,000 Coins</button>
+<p class="small">Each QR generation deducts exactly 100 coins. Daily claim is limited to once per calendar day.</p>
+</div>
+
+<div class="card">
+<h2>✉️ Encrypt Message</h2>
+<textarea id="message" placeholder="Type your private message..."></textarea>
+<input id="secret" type="password" placeholder="Encryption passphrase">
+<button id="makeQrBtn">🔒 Encrypt & Generate QR (100 coins)</button>
+<div id="qrArea" class="hidden">
+<canvas id="qr" width="260" height="260"></canvas>
+<p class="small" id="qrInfo"></p>
+<button id="shareBtn">Share QR Image</button>
+<button class="secondary" id="downloadBtn">Download QR PNG</button>
+<button class="secondary" id="copyBtn">Copy Encrypted Data</button>
+</div>
+</div>
+
+<div class="card">
+<h2>📷 Read Scanned QR Data</h2>
+<p class="small">Use your phone's camera or QR scanner, copy the scanned text, and paste it below. This page works offline; it does not require a camera library.</p>
+<textarea id="encryptedInput" placeholder="Paste encrypted QR data here..."></textarea>
+<input id="decryptSecret" type="password" placeholder="Same encryption passphrase">
+<button id="decryptBtn">🔓 Decrypt & Read Message</button>
+<div id="readResult" class="notice hidden"></div>
+</div>
+
+<div class="card">
+<h2>🗂️ QR History</h2>
+<div id="history"></div>
+<button class="secondary" id="backupBtn">Export Account Backup</button>
+<button class="danger" id="logoutBtn">Logout</button>
+</div>
+</section>
+
+<div class="card notice">
+<strong>Important:</strong> This is a local browser application. It does not send messages through a server. The QR contains encrypted data, not a website link. Sharing through WhatsApp or Instagram depends on your browser's sharing support.
+</div>
+</main>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+let currentUser = null;
+let currentQRData = "";
+let currentQRBlob = null;
+
+function today(){
+  const d = new Date();
+  return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
+}
+
+function keyFor(name){
+  return "secure_qr_vault_user_" + name.toLowerCase();
+}
+
+function readUser(name){
+  try{
+    return JSON.parse(localStorage.getItem(keyFor(name)));
+  }catch{
+    return null;
+  }
+}
+
+function saveUser(){
+  if(currentUser){
+    localStorage.setItem(keyFor(currentUser.name),JSON.stringify(currentUser));
+  }
+}
+
+function randomSalt(){
+  const a = new Uint8Array(16);
+  crypto.getRandomValues(a);
+  return a;
+}
+
+function toB64(bytes){
+  let s = "";
+  for(let i=0;i<bytes.length;i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+function fromB64(s){
+  const raw = atob(s);
+  const a = new Uint8Array(raw.length);
+  for(let i=0;i<raw.length;i++) a[i]=raw.charCodeAt(i);
+  return a;
+}
+
+async function deriveKey(passphrase,salt){
+  const material = await crypto.subtle.importKey(
+    "raw",enc.encode(passphrase),"PBKDF2",false,["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    {name:"PBKDF2",salt,iterations:250000,hash:"SHA-256"},
+    material,
+    {name:"AES-GCM",length:256},
+    false,
+    ["encrypt","decrypt"]
+  );
+}
+
+async function encryptMessage(message,passphrase){
+  const salt = randomSalt();
+  const iv = new Uint8Array(12);
+  crypto.getRandomValues(iv);
+  const key = await deriveKey(passphrase,salt);
+  const ciphertext = await crypto.subtle.encrypt(
+    {name:"AES-GCM",iv},key,enc.encode(message)
+  );
+  return JSON.stringify({
+    app:"SecureQRVault",
+    version:1,
+    algorithm:"AES-GCM",
+    kdf:"PBKDF2-SHA256",
+    salt:toB64(salt),
+    iv:toB64(iv),
+    data:toB64(new Uint8Array(ciphertext))
+  });
+}
+
+async function decryptMessage(payload,passphrase){
+  const obj = JSON.parse(payload);
+  if(obj.app!=="SecureQRVault" || obj.version!==1 ||
+     obj.algorithm!=="AES-GCM"){
+    throw new Error("यह Secure QR Vault का QR डेटा नहीं है।");
+  }
+  const key = await deriveKey(passphrase,fromB64(obj.salt));
+  const plaintext = await crypto.subtle.decrypt(
+    {name:"AES-GCM",iv:fromB64(obj.iv)},
+    key,
+    fromB64(obj.data)
+  );
+  return dec.decode(plaintext);
+}
+
+/*
+ QR generation uses a local QR encoder.
+ For a production-safe, fully offline QR encoder, place a QR library
+ directly in this HTML file. This page does not load a CDN.
+*/
+function showQrUnavailable(){
+  $("qrArea").classList.remove("hidden");
+  $("qr").style.display="none";
+  $("qrInfo").textContent =
+    "Encrypted data is ready. This standalone file needs an embedded QR encoder to draw a standards-compliant QR image. Copy the encrypted data below and use an offline QR encoder app.";
+  $("encryptedInput").value=currentQRData;
+}
+
+function updateUI(){
+  $("coins").textContent=currentUser.coins;
+  $("count").textContent=currentUser.qrDate===today()?currentUser.qrCount:0;
+  renderHistory();
+}
+
+function renderHistory(){
+  const box=$("history");
+  box.innerHTML="";
+  const list=currentUser.history||[];
+  if(!list.length){
+    box.innerHTML='<p class="small">No QR history yet.</p>';
+    return;
+  }
+  list.slice().reverse().forEach((item)=>{
+    const div=document.createElement("div");
+    div.className="item";
+    const title=document.createElement("strong");
+    title.textContent=item.date+" · "+item.label;
+    const detail=document.createElement("p");
+    detail.className="small";
+    detail.textContent="100 coins · Encrypted message";
+    const copy=document.createElement("button");
+    copy.className="secondary";
+    copy.textContent="Copy encrypted data";
+    copy.onclick=async()=>{
+      $("encryptedInput").value=item.data;
+      try{
+        await navigator.clipboard.writeText(item.data);
+        alert("Encrypted data copied.");
+      }catch{
+        alert("Data placed in the text box. Select and copy it manually.");
+      }
+    };
+    div.append(title,detail,copy);
+    box.appendChild(div);
+  });
+}
+
+$("loginBtn").addEventListener("click",async()=>{
+  const name=$("username").value.trim();
+  const password=$("password").value;
+  if(!/^[a-zA-Z0-9_-]{3,30}$/.test(name)){
+    $("loginStatus").textContent="Username must be 3–30 characters: letters, numbers, _ or -.";
+    return;
+  }
+  if(password.length<8){
+    $("loginStatus").textContent="Use a password with at least 8 characters.";
+    return;
+  }
+
+  let user=readUser(name);
+  const salt=enc.encode("SecureQRVault:"+name.toLowerCase());
+  const material=await crypto.subtle.importKey("raw",enc.encode(password),"PBKDF2",false,["deriveBits"]);
+  const digest=await crypto.subtle.deriveBits(
+    {name:"PBKDF2",salt,iterations:150000,hash:"SHA-256"},
+    material,256
+  );
+  const passwordHash=toB64(new Uint8Array(digest));
+
+  if(!user){
+    user={
+      name,
+      passwordHash,
+      coins:0,
+      claimDate:"",
+      qrDate:today(),
+      qrCount:0,
+      history:[]
+    };
+    localStorage.setItem(keyFor(name),JSON.stringify(user));
+  }else if(user.passwordHash!==passwordHash){
+    $("loginStatus").textContent="Incorrect password.";
+    return;
+  }
+
+  currentUser=user;
+  $("loginBox").classList.add("hidden");
+  $("app").classList.remove("hidden");
+  updateUI();
+});
+
+$("claimBtn").addEventListener("click",()=>{
+  if(currentUser.claimDate===today()){
+    alert("Daily coins already claimed today.");
+    return;
+  }
+  currentUser.coins+=20000;
+  currentUser.claimDate=today();
+  saveUser();
+  updateUI();
+  alert("20,000 coins added.");
+});
+
+$("makeQrBtn").addEventListener("click",async()=>{
+  const message=$("message").value;
+  const secret=$("secret").value;
+  if(!message.trim()||!secret){
+    alert("Enter a message and encryption passphrase.");
+    return;
+  }
+  if(currentUser.coins<100){
+    alert("Not enough coins. Claim your daily coins first.");
+    return;
+  }
+
+  const btn=$("makeQrBtn");
+  btn.disabled=true;
+  btn.textContent="Encrypting...";
+  try{
+    currentQRData=await encryptMessage(message,secret);
+    currentUser.coins-=100;
+    if(currentUser.qrDate!==today()){
+      currentUser.qrDate=today();
+      currentUser.qrCount=0;
+    }
+    currentUser.qrCount++;
+    currentUser.history.push({
+      date:new Date().toLocaleString(),
+      label:"QR #"+currentUser.history.length,
+      data:currentQRData
+    });
+    saveUser();
+    updateUI();
+    showQrUnavailable();
+    $("encryptedInput").value=currentQRData;
+  }catch(err){
+    alert("Encryption failed: "+err.message);
+  }finally{
+    btn.disabled=false;
+    btn.textContent="🔒 Encrypt & Generate QR (100 coins)";
+  }
+});
+
+$("decryptBtn").addEventListener("click",async()=>{
+  const payload=$("encryptedInput").value.trim();
+  const secret=$("decryptSecret").value;
+  if(!payload||!secret){
+    alert("Paste scanned QR data and enter the passphrase.");
+    return;
+  }
+  try{
+    const message=await decryptMessage(payload,secret);
+    $("readResult").textContent=message;
+    $("readResult").classList.remove("hidden");
+  }catch{
+    $("readResult").textContent="Could not decrypt. Check the QR data and passphrase.";
+    $("readResult").classList.remove("hidden");
+  }
+});
+
+$("copyBtn").addEventListener("click",async()=>{
+  if(!currentQRData)return;
+  try{
+    await navigator.clipboard.writeText(currentQRData);
+    alert("Encrypted data copied.");
+  }catch{
+    $("encryptedInput").value=currentQRData;
+    alert("Select the encrypted text and copy it manually.");
+  }
+});
+
+$("downloadBtn").addEventListener("click",()=>{
+  alert("A QR image cannot be drawn until a QR encoder is embedded in this standalone HTML file.");
+});
+
+$("shareBtn").addEventListener("click",async()=>{
+  if(!currentQRData)return;
+  if(navigator.share){
+    try{
+      await navigator.share({
+        title:"Secure QR Vault encrypted data",
+        text:currentQRData
+      });
+    }catch(err){
+      if(err.name!=="AbortError") alert("Sharing was unavailable.");
+    }
+  }else{
+    try{
+      await navigator.clipboard.writeText(currentQRData);
+      alert("Encrypted data copied. Paste it into your preferred app.");
+    }catch{
+      alert("Copy the encrypted data from the text box manually.");
+    }
+  }
+});
+
+$("backupBtn").addEventListener("click",()=>{
+  const blob=new Blob([JSON.stringify(currentUser,null,2)],{type:"application/json"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url;
+  a.download="secure-qr-vault-backup.json";
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+$("logoutBtn").addEventListener("click",()=>{
+  currentUser=null;
+  currentQRData="";
+  $("app").classList.add("hidden");
+  $("loginBox").classList.remove("hidden");
+  $("password").value="";
+});
+</script>
+</body>
+  </html>
